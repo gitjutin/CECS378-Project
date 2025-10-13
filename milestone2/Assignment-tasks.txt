@@ -38,10 +38,3 @@
 
 # Example (Smart Transportation):
 # Traffic cameras publish alerts to a topic (e.g., “accidents”), while emergency services subscribe and receive real-time notifications.
-
-def main():
-    # TODO: implementation here
-    print("test")
-
-if __name__ == "__main__":
-    main()
