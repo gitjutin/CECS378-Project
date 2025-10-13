@@ -1,0 +1,47 @@
+
+# Assignment Tasks:
+
+# -------------------------------------------------------------------------------------------------
+
+# 1. Direct Communication – Interprocess Communication (IPC)
+# Implement IPC between two or more local or networked processes:
+
+# Use sockets (TCP or UDP) to simulate communication between system 
+# components such as services or data collectors.
+
+# Optionally, demonstrate use of pipes or shared memory (e.g., for intra-node communication).
+
+# Example (Smart Transportation):
+# A roadside sensor (simulated as a socket client) sends traffic density data to a central aggregator (socket server) in real time.
+
+# -------------------------------------------------------------------------------------------------
+
+# 2. Remote Communication – RPC or REST API
+# Implement Remote Procedure Calls or RESTful APIs for one or more components:
+
+# Use Python libraries like xmlrpc, gRPC, Pyro4 for RPC.
+# Or, develop a RESTful service using Flask, FastAPI, or similar.
+
+# Implement at least two endpoints or callable methods.
+
+# Example (Smart Transportation):
+# A client requests alternate routing from a cloud-based routing service via a REST API.
+
+# -------------------------------------------------------------------------------------------------
+
+# 3. Indirect Communication – Message Queues or Pub-Sub
+# Demonstrate asynchronous communication between decoupled components:
+
+# Use a message broker like RabbitMQ, Kafka, ZeroMQ, or Celery with Redis.
+
+# Implement a producer-consumer or publish-subscribe architecture.
+
+# Example (Smart Transportation):
+# Traffic cameras publish alerts to a topic (e.g., “accidents”), while emergency services subscribe and receive real-time notifications.
+
+def main():
+    # TODO: implementation here
+    print("test")
+
+if __name__ == "__main__":
+    main()
