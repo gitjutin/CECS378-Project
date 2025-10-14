@@ -21,16 +21,22 @@ connections = {}  # { (course_id, student_id): websocket }
 async def ensure_join(course_id: str, student_id: str, student_name: str):
     key = (course_id, student_id)
     ws = connections.get(key)
+
+    # reuse an open connection if available 
     if ws and ws.open:
         return ws
-    # open new connection and join the session
+    # otherwise open new connection and join the session
     ws = await websockets.connect(WS_URL)
+
+    # send a registration payload to join the collaboration session 
     await ws.send(json.dumps({
         "type": "join_session",
         "course_id": course_id,
         "student_id": student_id,
         "student_name": student_name or student_id
     }))
+
+    # cache the WebSocket for reuse 
     connections[key] = ws
     return ws
 
