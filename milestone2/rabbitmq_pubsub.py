@@ -9,11 +9,11 @@ Examples: Notifications, search indexing, backup services
 
 import asyncio, json
 import websockets
-import redis.asyncio as aioredis
+import redis.asyncio as aioredis # using Redis as a lightweight pub/sub broker 
 
 WS_URL = "ws://127.0.0.1:8765"   # your Task-1 server
-REDIS_HOST = "127.0.0.1"
-REDIS_PORT = 6379
+REDIS_HOST = "127.0.0.1" # assumes Redis is running locally 
+REDIS_PORT = 6379 # default Redis port
 
 # Maintain one WS connection per (course_id, student_id)
 connections = {}  # { (course_id, student_id): websocket }
