@@ -56,15 +56,16 @@ async def handle_event(evt: dict):
     # handle edit-type events coming from Redis
     if etype == "live_edit":
         edit = evt.get("edit", {})
-        # the WebSocket server expects messages shaped like {"type": "live_edit", "edit":{...}}
+        # the WebSocket server expects messages like {"type": "live_edit", "edit":{...}}
         await ws.send(json.dumps({
             "type": "live_edit",
             "edit": edit
         }))
 
+    # handle chat messages being published to the channel
     elif etype == "chat_message":
         msg = evt.get("message", "")
-        # Your server expects: {"type":"chat_message","message":"..."}
+        # the server expects messages like {"type": "chat_message", "message":"..."}
         await ws.send(json.dumps({
             "type": "chat_message",
             "message": msg
@@ -72,14 +73,22 @@ async def handle_event(evt: dict):
 
 async def main():
     print("[ws_bridge] starting; subscribing to course:*:events")
-    r = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-    p = r.pubsub()
-    await p.psubscribe("course:*:events")
 
+    # connect to Redis using asyncio interface 
+    r = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+    # create a Pub/Sub object and subscribe to all course event channels
+    p = r.pubsub()
+    await p.psubscribe("course:*:events") # pattern subscription 
+
+    # continue lisenting for new messages
     async for msg in p.listen():
+
+        # skip non message evnts like subscribe and confirmations 
         if msg["type"] not in {"message", "pmessage"}:
             continue
         try:
+            # parse the message JSON and hand it off to the handler
             evt = json.loads(msg["data"])
             await handle_event(evt)
         except Exception as e:
