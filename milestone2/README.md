@@ -12,31 +12,32 @@ How to Run Each Module (This may differ)
 - Using MacOs:
 - Install all dependencies inside a virtual environment
   
-  python3 -m venv .venv
-  source .venv/bin/activate
-  python3 -m pip install fastapi uvicorn websockets redis asyncio
+  python3 -m venv .venv <br>
+  source .venv/bin/activate <br>
+  python3 -m pip install fastapi uvicorn websockets redis asyncio <br>
 
-  **Some additional services**
+  **Some additional services** <br>
   
-  brew install redis
-  brew services start redis
+  brew install redis <br>
+  brew services start redis <br>
 
-  **WebSocket Server**
+  **WebSocket Server** <br>
   
-  cd milestone2
-  source .venv/bin/activate
-  python3 websocket_server.py
+  cd milestone2 <br>
+  source .venv/bin/activate <br>
+  python3 websocket_server.py <br>
 
   **Rest API Server**
   
-  cd milestone2
-  source .venv/bin/activate
-  uvicorn rest_api_server:app --reload --port 8000
+  cd milestone2 <br>
+  source .venv/bin/activate <br>
+  uvicorn rest_api_server:app --reload --port 8000 <br>
 
-  **Redis Pub/Sub**
-  cd milestone2
-  source .venv/bin/activate
-  python3 rabbitmq_pubsub.py
+  **Redis Pub/Sub** <br>
+  
+  cd milestone2 <br>
+  source .venv/bin/activate <br>
+  python3 rabbitmq_pubsub.py <br>
 
 
 
