@@ -1,4 +1,4 @@
-Component Purpose
+# **Component Purpose**
 - The websocket_server.py demonstrates peer-to-peer communication as to which we know is IPC. This implments real-time collaboration and chat features.
 - Websockets also enable low-latency and direct connections between users within the same course.
 
@@ -8,8 +8,7 @@ Component Purpose
 - The rabbitmq_pubsub.py lets students subscribe to courses and their channels so they can get any forwarded messages that is connected to the websocket client.
 - This ensures that any class note updates are delivered asynchronously and demonstrates decoupled communication between the websocket layers.
 
-How to Run Each Module (This may differ)
-- Using MacOs:
+# **How to Run Each Module (This may differ)**
 - Install all dependencies inside a virtual environment
   
   python3 -m venv .venv <br>
