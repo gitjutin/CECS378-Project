@@ -58,7 +58,7 @@
   
   python ws_client.py --course CECS327 --username angie.nguyen --edit typing
    <br>
-  other optons for --edit: typing, insert_line, delete_word <br>
+  other options for --edit: typing, insert_line, delete_word <br>
 
 
 
