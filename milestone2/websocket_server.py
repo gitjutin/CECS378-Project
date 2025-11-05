@@ -13,11 +13,17 @@ import argparse
 import json
 from datetime import datetime
 
+
+def get_username(data: dict) -> str:
+    return (data.get("username")
+            or data.get("student_name")
+            or data.get("student_id")
+            or "Anonymous")
 # -------------------------
 # Session tracking (yours)
 # -------------------------
 active_sessions = {}   # course_id -> set(websocket)
-student_info = {}      # websocket -> {student_id, student_name, course_id}
+student_info = {}      # websocket -> {username, course_id}
 
 # -------------------------
 # Concurrency config (CLI-tunable)
@@ -97,7 +103,6 @@ async def broadcast_to_peers(course_id, message, exclude=None):
 # -------------------------
 async def handle_peer_connection(websocket):  # <- 1 arg for modern websockets
     course_id = None
-    student_id = None
 
     try:
         async for message in websocket:
@@ -107,13 +112,11 @@ async def handle_peer_connection(websocket):  # <- 1 arg for modern websockets
             # ---- join_session ----
             if msg_type == 'join_session':
                 course_id = data.get('course_id')
-                student_id = data.get('student_id')
-                student_name = data.get('student_name', 'Anonymous')
+                username = get_username(data)
 
                 active_sessions.setdefault(course_id, set()).add(websocket)
                 student_info[websocket] = {
-                    'student_id': student_id,
-                    'student_name': student_name,
+                    'username': username,
                     'course_id': course_id
                 }
 
@@ -124,23 +127,23 @@ async def handle_peer_connection(websocket):  # <- 1 arg for modern websockets
                     state.consumer_task = asyncio.create_task(apply_worker(course_id))
                     print(f"[CONC] started worker for course {course_id}")
 
-                print(f"[P2P] {student_name} joined editing session for {course_id}")
+                print(f"[P2P] {username} joined editing session for {course_id}")
 
                 await broadcast_to_peers(course_id, {
                     'type': 'peer_joined',
-                    'student_id': student_id,
-                    'student_name': student_name,
+                    'username': username,
                     'timestamp': datetime.now().isoformat()
                 }, exclude=websocket)
 
             # ---- live_edit -> enqueue ----
             elif msg_type == 'live_edit' and course_id is not None:
+                username = student_info.get(websocket, {}).get('username', 'Anonymous')
                 edit_data = data.get('edit', {})
-                print(f"[P2P] Live edit from {student_id}: {edit_data.get('action')}")
+                print(f"[P2P] Live edit from {username}: {edit_data.get('action')}")
                 await get_state(course_id).queue.put({
                     "broadcast": {
                         'type': 'live_edit',
-                        'student_id': student_id,
+                        'username': username,
                         'edit': edit_data,
                         'timestamp': datetime.now().isoformat()
                     },
@@ -149,21 +152,20 @@ async def handle_peer_connection(websocket):  # <- 1 arg for modern websockets
 
             # ---- chat_message -> enqueue ----
             elif msg_type == 'chat_message' and course_id is not None:
+                username = student_info.get(websocket, {}).get('username', 'Anonymous')
                 message_text = data.get('message', '')
-                name = student_info.get(websocket, {}).get('student_name', 'Anonymous')
-                print(f"[P2P Chat] {student_id}: {message_text}")
+                print(f"[P2P Chat] {username}: {message_text}")
                 await get_state(course_id).queue.put({
                     "broadcast": {
                         'type': 'chat_message',
-                        'student_id': student_id,
-                        'student_name': name,
+                        'username': username,
                         'message': message_text,
                         'timestamp': datetime.now().isoformat()
                     }
                 })
 
     except websockets.exceptions.ConnectionClosed:
-        print(f"[P2P] Connection closed for {student_id}")
+        print(f"[P2P] Connection closed")
 
     finally:
         info = student_info.pop(websocket, None)
@@ -181,8 +183,7 @@ async def handle_peer_connection(websocket):  # <- 1 arg for modern websockets
                     print(f"[CONC] stopped worker for empty course {course_id} (total_ops={state.total_ops})")
             await broadcast_to_peers(course_id, {
                 'type': 'peer_left',
-                'student_id': info['student_id'],
-                'student_name': info['student_name'],
+                'username': info['username'],
                 'timestamp': datetime.now().isoformat()
             })
 

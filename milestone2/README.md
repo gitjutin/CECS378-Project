@@ -38,6 +38,30 @@
   source .venv/bin/activate <br>
   python3 rabbitmq_pubsub.py <br>
 
+  **TO START P2P SERVER** <br>
+ cd milestone2 <br>
+ source ../.venv/bin/activate <br>
+ python websocket_server.py <br>
+ <br>
+ **OPEN NEW TERMINAL FOR CLIENT TEST CASES** <br>
+
+ **Client usage for test cases** <br>
+  cd milestone2 <br>
+  python ws_client.py --course <COURSE_ID> --username <USERNAME> [--chat <TEXT>] [--edit <ACTION>] <br>
+ <br>
+
+  quick copy and paste test in terminal 2 <br>
+  <br>
+
+  python ws_client.py --course CECS327 --username angie.nguyen --chat 'hello class'
+ <br>
+  
+  python ws_client.py --course CECS327 --username angie.nguyen --edit typing
+   <br>
+  other optons for --edit: typing, insert_line, delete_word <br>
+
+
+
 
 
 
