@@ -9,174 +9,209 @@ Uses TCP sockets for reliable inter-process communication.
 
 import asyncio
 import websockets
-
-
-
+import argparse
 import json
 from datetime import datetime
 
-#-------------------------------------
-# Track active P2P sessions per course
-#-------------------------------------
 
-# Active collaboration sessions per course.
-# Each course_id maps to a set of connected WebSocket objects (students currently online).
-active_sessions = {}  # {course_id: {student_websockets}}
+def get_username(data: dict) -> str:
+    return (data.get("username")
+            or data.get("student_name")
+            or data.get("student_id")
+            or "Anonymous")
+# -------------------------
+# Session tracking (yours)
+# -------------------------
+active_sessions = {}   # course_id -> set(websocket)
+student_info = {}      # websocket -> {username, course_id}
 
-# Tracks information about each connected student.
-# Key = the WebSocket connection, Value = { student_id, student_name, course_id }
-student_info = {}     # {websocket: student_data}
+# -------------------------
+# Concurrency config (CLI-tunable)
+# -------------------------
+use_lock = True
+max_section_writes = 3
+race_delay_sec = 0.0005
 
-# -------------------------------------------------------------------
-#  Main connection handler: triggered every time a new peer connects.
-# -------------------------------------------------------------------
-async def handle_peer_connection(websocket, path):
+# -------------------------
+# Per-course concurrent state
+# -------------------------
+class CourseState:
+    def __init__(self):
+        self.lock = asyncio.Lock()                       # protects shared state
+        self.apply_gate = asyncio.Semaphore(max_section_writes)
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self.total_ops = 0                               # shared counter (race demo)
+        self.shutdown = asyncio.Event()
+        self.consumer_task: asyncio.Task | None = None
+
+course_state: dict[str, CourseState] = {}
+
+def get_state(course_id: str) -> CourseState:
+    if course_id not in course_state:
+        course_state[course_id] = CourseState()
+    return course_state[course_id]
+
+# -------------------------
+# Background worker
+# -------------------------
+async def apply_worker(course_id: str):
     """
-    Handle P2P connection between students
-    TCP socket-based IPC for real-time collaboration
-
-    This function continuously listens for messages from a connected peer
-    and acts based on the 'type' of message received.
+    Pull from per-course queue, throttle with Semaphore, demo race (lock on/off),
+    then broadcast to peers.
     """
-    course_id = None
-    student_id = None
-    
+    state = get_state(course_id)
     try:
-        # Asynchronous loop: keeps reading messages from this websocket
-        async for message in websocket:
-            data = json.loads(message)          # Parse JSON payload
-            msg_type = data.get('type')         # Determine msg purpose 
-                                                # Ex: 'join_session' or 'live_edit'
+        while not state.shutdown.is_set():
+            try:
+                item = await asyncio.wait_for(state.queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
 
-            # -------------------------------------------------------
-            # Case 1: Student joins a session (register themselves)
-            # -------------------------------------------------------
+            async with state.apply_gate:
+                if use_lock:
+                    async with state.lock:
+                        tmp = state.total_ops
+                        await asyncio.sleep(race_delay_sec)  # widen race window
+                        state.total_ops = tmp + 1
+                else:
+                    tmp = state.total_ops
+                    await asyncio.sleep(race_delay_sec)
+                    state.total_ops = tmp + 1
+
+                await broadcast_to_peers(course_id, item["broadcast"], exclude=item.get("exclude"))
+    finally:
+        print(f"[CONC] worker stopped course={course_id} total_ops={state.total_ops} USE_LOCK={use_lock}")
+
+# -------------------------
+# Broadcast helper (keep this ONE)
+# -------------------------
+async def broadcast_to_peers(course_id, message, exclude=None):
+    peers = active_sessions.get(course_id)
+    if not peers:
+        return
+    message_json = json.dumps(message)
+    for peer in list(peers):  # snapshot to avoid 'set changed size' during iter
+        if peer is exclude:
+            continue
+        try:
+            await peer.send(message_json)
+        except Exception:
+            pass  # best-effort
+
+# -------------------------
+# WebSocket handler
+# -------------------------
+async def handle_peer_connection(websocket):  # <- 1 arg for modern websockets
+    course_id = None
+
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            msg_type = data.get('type')
+
+            # ---- join_session ----
             if msg_type == 'join_session':
-                # Student joins P2P editing session
                 course_id = data.get('course_id')
-                student_id = data.get('student_id')
-                student_name = data.get('student_name', 'Anonymous')
-                
-                # Create session entry if it doesn’t exist
-                if course_id not in active_sessions:
-                    active_sessions[course_id] = set()
-                # Add this student's connection to the session set
-                active_sessions[course_id].add(websocket)
-                
-                # Store data about this connection
+                username = get_username(data)
+
+                active_sessions.setdefault(course_id, set()).add(websocket)
                 student_info[websocket] = {
-                    'student_id': student_id,
-                    'student_name': student_name,
+                    'username': username,
                     'course_id': course_id
                 }
-                
-                print(f"[P2P] {student_name} joined editing session for {course_id}")
-                
-                # Notify all other peers in the same course session
+
+                # start per-course worker if needed
+                state = get_state(course_id)
+                if state.consumer_task is None or state.consumer_task.done():
+                    state.shutdown.clear()
+                    state.consumer_task = asyncio.create_task(apply_worker(course_id))
+                    print(f"[CONC] started worker for course {course_id}")
+
+                print(f"[P2P] {username} joined editing session for {course_id}")
+
                 await broadcast_to_peers(course_id, {
                     'type': 'peer_joined',
-                    'student_id': student_id,
-                    'student_name': student_name,
+                    'username': username,
                     'timestamp': datetime.now().isoformat()
                 }, exclude=websocket)
 
-            # -------------------------------------------------------
-            # Case 2: Live edit message — broadcast real-time edits
-            # -------------------------------------------------------    
-            elif msg_type == 'live_edit':
-                # Student making real-time edit (P2P broadcast)
-                edit_data = data.get('edit')
-                print(f"[P2P] Live edit from {student_id}: {edit_data.get('action')}")
-                
-                # Broadcast edit to all peers in same session
-                await broadcast_to_peers(course_id, {
-                    'type': 'live_edit',
-                    'student_id': student_id,
-                    'edit': edit_data,
-                    'timestamp': datetime.now().isoformat()
-                }, exclude=websocket)
-
-            # -------------------------------------------------------
-            # Case 3: Chat message — real-time peer chat
-            # -------------------------------------------------------    
-            elif msg_type == 'chat_message':
-                # P2P chat between students
-                message_text = data.get('message')
-                print(f"[P2P Chat] {student_id}: {message_text}")
-                
-                # Broadcast chat to all peers
-                await broadcast_to_peers(course_id, {
-                    'type': 'chat_message',
-                    'student_id': student_id,
-                    'student_name': student_info[websocket]['student_name'],
-                    'message': message_text,
-                    'timestamp': datetime.now().isoformat()
+            # ---- live_edit -> enqueue ----
+            elif msg_type == 'live_edit' and course_id is not None:
+                username = student_info.get(websocket, {}).get('username', 'Anonymous')
+                edit_data = data.get('edit', {})
+                print(f"[P2P] Live edit from {username}: {edit_data.get('action')}")
+                await get_state(course_id).queue.put({
+                    "broadcast": {
+                        'type': 'live_edit',
+                        'username': username,
+                        'edit': edit_data,
+                        'timestamp': datetime.now().isoformat()
+                    },
+                    "exclude": websocket
                 })
-    
-    # -------------------------------------------------------------------
-    # If a connection drops unexpectedly (user closes tab or disconnects)
-    # -------------------------------------------------------------------
-    except websockets.exceptions.ConnectionClosed:
-        print(f"[P2P] Connection closed for {student_id}")
-    
 
-    # -------------------------------------------------------------------
-    # Always run this cleanup logic when a peer disconnects
-    # -------------------------------------------------------------------
+            # ---- chat_message -> enqueue ----
+            elif msg_type == 'chat_message' and course_id is not None:
+                username = student_info.get(websocket, {}).get('username', 'Anonymous')
+                message_text = data.get('message', '')
+                print(f"[P2P Chat] {username}: {message_text}")
+                await get_state(course_id).queue.put({
+                    "broadcast": {
+                        'type': 'chat_message',
+                        'username': username,
+                        'message': message_text,
+                        'timestamp': datetime.now().isoformat()
+                    }
+                })
+
+    except websockets.exceptions.ConnectionClosed:
+        print(f"[P2P] Connection closed")
+
     finally:
-        # Cleanup on disconnect
-        if websocket in student_info:
-            info = student_info[websocket]
+        info = student_info.pop(websocket, None)
+        if info:
             course_id = info['course_id']
-            
-            # Remove student from P2P session list
-            if course_id in active_sessions:
-                active_sessions[course_id].discard(websocket)
-                if len(active_sessions[course_id]) == 0:
-                    del active_sessions[course_id]
-            
-            # Remove student record
-            del student_info[websocket]
-            
-            # Notify peers someone left
+            peers = active_sessions.get(course_id)
+            if peers:
+                peers.discard(websocket)
+                # if last peer left, stop worker
+                if not peers:
+                    state = get_state(course_id)
+                    state.shutdown.set()
+                    if state.consumer_task:
+                        state.consumer_task.cancel()
+                    print(f"[CONC] stopped worker for empty course {course_id} (total_ops={state.total_ops})")
             await broadcast_to_peers(course_id, {
                 'type': 'peer_left',
-                'student_id': info['student_id'],
-                'student_name': info['student_name'],
+                'username': info['username'],
                 'timestamp': datetime.now().isoformat()
             })
 
-async def broadcast_to_peers(course_id, message, exclude=None):
-    """
-    Broadcast message to all peers in a P2P session
-    Simulates direct process-to-process communication
-    """
-    if course_id not in active_sessions:
-        return
-    
-    message_json = json.dumps(message)
-    
-    for peer in active_sessions[course_id]:
-        if peer != exclude:
-            try:
-                await peer.send(message_json)
-            except:
-                pass
-
-# -------------------------------------------------------------------
-#  Start the WebSocket server
-# -------------------------------------------------------------------
-async def main():
-    """Start P2P coordination server"""
+# -------------------------
+# Server bootstrap
+# -------------------------
+async def main(host: str, port: int):
     print("="*60)
     print("Campus Note Collaboration - P2P Node (IPC)")
-    print("Real-time editing and chat via TCP sockets")
-    print("Listening on: ws://localhost:8765")  # WebSocket URL clients connect to
+    print("Real-time editing and chat via WebSockets")
+    print(f"Listening on: ws://{host}:{port}")
+    print(f"USE_LOCK={use_lock}  MAX_SECTION_WRITES={max_section_writes}  RACE_DELAY_SEC={race_delay_sec}")
     print("="*60)
-    
-    # websockets.serve() creates an async TCP server that speaks the WebSocket protocol
-    async with websockets.serve(handle_peer_connection, "0.0.0.0", 8765):
-        await asyncio.Future()
+    async with websockets.serve(handle_peer_connection, host, port):
+        await asyncio.Future()  # run forever
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--no-lock", action="store_true", help="disable lock to demonstrate race condition")
+    parser.add_argument("--lanes", type=int, default=3, help="semaphore capacity (concurrent applies)")
+    parser.add_argument("--race-delay", type=float, default=0.0005, help="delay to widen race window")
+    args = parser.parse_args()
+
+    # apply CLI toggles BEFORE any CourseState is created
+    use_lock = not args.no_lock
+    max_section_writes = args.lanes
+    race_delay_sec = args.race_delay
+
+    asyncio.run(main(args.host, args.port))
