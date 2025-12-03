@@ -4,7 +4,39 @@ import json
 import uuid
 import websockets
 
+class Transaction:
+    """
+    A transaction is like a temporary workspace where we collect changes
+    before deciding to save them or throw them away.
+    
+    write_buffer explanation:
+    - When the transaction wants to change a value, we don't update the
+    real store right away.
+    - Instead, we hold the change here in write_buffer for now.
+    - Only if the transaction fully succeeds (everyone says "YES"),
+    we apply these changes to the real store.
+    - If the transaction fails, we just delete this buffer and nothing
+    in the real store was changed.
 
+    Example:
+        txn_write("counter", +1)
+        write_buffer becomes {"counter": 1}
+        The real store is updated ONLY when we commit.
+    """
+    def __init__(self, txn_id: str, coordinator: str, expected_votes: int = 0):
+        self.txn_id = txn_id
+        self.coordinator = coordinator
+        self.state = "ACTIVE"
+        self.resources: set[str] = set()
+
+        # Temporary changes for this transaction.
+        # These are not applied to the real store yet.
+        self.write_buffer: dict[str, int] = {}
+
+        # Stores YES/NO responses from other nodes.
+        self.votes: dict[str, bool] = {}
+        self.expected_votes = expected_votes
+    
 class PeerNode:
 
     def __init__(self, name: str, port: int, peer_urls: list[str]):
@@ -13,6 +45,12 @@ class PeerNode:
         self.known_peers: set[str] = set(peer_urls)  
         self.connections: set[websockets.WebSocketClientProtocol] = set()
         self.seen_messages: set[str] = set()
+
+        # ---- simple replicated key/value state for transactions ----
+        # This is the shared "data" all peers will update transactionally.
+        self.store: dict[str, int] = {}          # e.g., {"shared_counter": 5}
+        self.lock_table: dict[str, str] = {}     # resource_id -> holding txn_id
+        self.transactions: dict[str, Transaction] = {}
 
         # ---- lamport logical clock ----
 
@@ -46,6 +84,153 @@ class PeerNode:
         print(f"[{self.name}][ts = {self.clock}]{label}")
 
 
+# ---------- Transaction / lock helpers ----------
+
+    def new_txn_id(self) -> str:
+        """Use Lamport time + node name for a unique, ordered txn id."""
+        ts = self.tick()
+        return f"{ts}-{self.name}"
+
+    def _acquire_lock(self, txn_id: str, resource_id: str) -> bool:
+        """Strict 2PL: only one txn can hold the write lock at a time."""
+        holder = self.lock_table.get(resource_id)
+        if holder is None or holder == txn_id:
+            self.lock_table[resource_id] = txn_id
+            return True
+        return False
+
+    def _release_locks(self, txn_id: str) -> None:
+        """Release all locks held by this transaction."""
+        to_release = [res for res, holder in self.lock_table.items() if holder == txn_id]
+        for res in to_release:
+            del self.lock_table[res]
+
+    def _apply_write_buffer(self, txn: Transaction) -> None:
+        """
+        Apply transactional writes to the replicated store.
+        We treat writes as 'delta' increments on integer values.
+        """
+        for resource_id, delta in txn.write_buffer.items():
+            prev = self.store.get(resource_id, 0)
+            new_val = prev + delta
+            self.store[resource_id] = new_val
+            self.log_event(
+                f"TXN {txn.txn_id} APPLY {resource_id}: {prev} -> {new_val}"
+            )
+        txn.write_buffer.clear()
+
+# ---------- Public transaction API ----------
+
+    def begin_transaction(self) -> str:
+        """Begin a new transaction where this node is the coordinator."""
+        txn_id = self.new_txn_id()
+        txn = Transaction(txn_id, coordinator=self.name)
+        self.transactions[txn_id] = txn
+        self.log_event(f"TXN {txn_id} BEGIN (coordinator={self.name})")
+        return txn_id
+
+    def txn_write(self, txn_id: str, resource_id: str, delta: int) -> bool:
+        """
+        Buffer a write (increment) inside a transaction.
+        Uses strict 2PL for concurrency control.
+        """
+        txn = self.transactions.get(txn_id)
+        if txn is None or txn.state != "ACTIVE":
+            return False
+
+        if not self._acquire_lock(txn_id, resource_id):
+            # lock conflict -> caller should abort
+            self.log_event(f"TXN {txn_id} LOCK CONFLICT on {resource_id}")
+            return False
+
+        txn.resources.add(resource_id)
+        current = txn.write_buffer.get(resource_id, 0)
+        txn.write_buffer[resource_id] = current + delta
+        self.log_event(f"TXN {txn_id} WRITE {resource_id} += {delta}")
+        return True
+
+    async def commit_transaction(self, txn_id: str, timeout: float = 20.0):
+        """
+        Coordinator side of a simple 2-Phase Commit:
+        1) Broadcast PREPARE with writes
+        2) Collect VOTEs
+        3) If all YES -> COMMIT, else -> ABORT
+        """
+        txn = self.transactions.get(txn_id)
+        if txn is None or txn.state != "ACTIVE":
+            return
+
+        # how many other participants do we expect votes from?
+        txn.expected_votes = len(self.connections)
+        txn.state = "PREPARED"
+
+        prepare_msg = {
+            "type": "txn_prepare",
+            "from": self.name,
+            "coordinator": self.name,
+            "txn_id": txn_id,
+            "writes": txn.write_buffer,
+        }
+        await self.broadcast(prepare_msg)
+
+        # if there are no other peers, we can commit locally
+        if txn.expected_votes == 0:
+            self.log_event(f"TXN {txn_id} COMMIT (single node)")
+            self._apply_write_buffer(txn)
+            txn.state = "COMMITTED"
+            self._release_locks(txn_id)
+            return
+
+        # wait for votes or timeout
+        loop = asyncio.get_event_loop()
+        start = loop.time()
+        while len(txn.votes) < txn.expected_votes and (loop.time() - start) < timeout:
+            await asyncio.sleep(0.1)
+
+        all_yes = (
+            txn.votes
+            and len(txn.votes) == txn.expected_votes
+            and all(txn.votes.values())
+        )
+
+        if all_yes:
+            self.log_event(f"TXN {txn_id} COMMIT (votes={txn.votes})")
+            self._apply_write_buffer(txn)
+            txn.state = "COMMITTED"
+            self._release_locks(txn_id)
+            await self.broadcast({
+                "type": "txn_commit",
+                "from": self.name,
+                "coordinator": self.name,
+                "txn_id": txn_id,
+            })
+        else:
+            self.log_event(f"TXN {txn_id} ABORT (votes={txn.votes})")
+            await self.abort_transaction(txn_id, reason="vote failure or timeout")
+
+    async def abort_transaction(self, txn_id: str, reason: str = ""):
+        """
+        Roll back a transaction: discard buffered writes and release locks.
+        If we're the coordinator, broadcast an ABORT to participants.
+        """
+        txn = self.transactions.get(txn_id)
+        if txn is None or txn.state in ("COMMITTED", "ABORTED"):
+            return
+
+        txn.state = "ABORTED"
+        txn.write_buffer.clear()
+        self._release_locks(txn_id)
+        self.log_event(f"TXN {txn_id} ABORT local ({reason})")
+
+        if txn.coordinator == self.name:
+            await self.broadcast({
+                "type": "txn_abort",
+                "from": self.name,
+                "coordinator": self.name,
+                "txn_id": txn_id,
+                "reason": reason,
+            })
+
 
   # ---- server ----
     async def start_server(self):
@@ -61,7 +246,7 @@ class PeerNode:
                 self.connections.discard(ws)
                 print(f"[{self.name}] inbound connection closed")
 
-        server = await websockets.serve(handler, "localhost", self.port)
+        server = await websockets.serve(handler, host="", port=self.port)
         print(f"[{self.name}] listening on ws://localhost:{self.port}")
         return server
 
@@ -181,9 +366,178 @@ class PeerNode:
         elif msg_type == "cs_release":
             self.log_event(f"RA: {data.get('from')} released CS")
 
+# ---------- Transaction protocol messages ----------
+
+# This keeps all message-type handling in one place AND 
+# ensures these messages get processed before they're rebroadcast.
+        elif msg_type == "txn_prepare":
+            await self._handle_txn_prepare(data)
+
+        elif msg_type == "txn_vote":
+            self._handle_txn_vote(data)
+
+        elif msg_type == "txn_commit":
+            self._handle_txn_commit(data)
+
+        elif msg_type == "txn_abort":
+            self._handle_txn_abort(data)
 
         # gossip: forward to other peers
         await self.broadcast(data, exclude=src_ws)
+
+    # ============================================================
+    #  Transaction Message Handlers
+    #  These respond to: txn_prepare, txn_vote, txn_commit, txn_abort
+    # ============================================================
+
+    async def _handle_txn_prepare(self, data: dict):
+        """
+        Another node is asking us to prepare a transaction.
+
+        What we do here:
+        1. Try to lock the resources they want to change.
+        2. If we can lock all of them → we vote YES.
+        3. If not → we vote NO.
+        4. Store their changes in our write_buffer (but do not apply them yet).
+        """
+
+        txn_id = data["txn_id"]
+        coordinator = data.get("coordinator")
+        writes: dict[str, int] = data.get("writes", {})
+
+        # If this is the first time we hear of this transaction, create a record for it.
+        txn = self.transactions.get(txn_id)
+        if txn is None:
+            txn = Transaction(txn_id, coordinator=coordinator)
+            self.transactions[txn_id] = txn
+
+        # Try to lock every resource they want to modify.
+        can_lock_all = True
+        for resource_id in writes.keys():
+            if not self._acquire_lock(txn_id, resource_id):
+                can_lock_all = False
+                break
+
+        # If we can lock everything, save the writes.
+        if can_lock_all:
+            txn.state = "PREPARED"
+            txn.resources.update(writes.keys())
+
+            # Add the incoming "delta changes" into our write_buffer
+            for resource_id, delta in writes.items():
+                prev = txn.write_buffer.get(resource_id, 0)
+                txn.write_buffer[resource_id] = prev + delta
+
+            vote = True
+        else:
+            # Could not lock → must reject
+            txn.state = "ABORTED"
+            self._release_locks(txn_id)
+            vote = False
+
+        self.log_event(f"TXN {txn_id}: PREPARE from {coordinator} → vote={vote}")
+
+        # Send vote back (gossiped)
+        vote_msg = {
+            "type": "txn_vote",
+            "from": self.name,
+            "coordinator": coordinator,
+            "txn_id": txn_id,
+            "vote": vote,
+        }
+
+        await self.broadcast(vote_msg)
+
+
+    def _handle_txn_vote(self, data: dict):
+        """
+        Only the coordinator cares about votes.
+
+        Here we store who voted YES/NO so the coordinator
+        can later decide whether to COMMIT or ABORT.
+        """
+
+        coordinator = data.get("coordinator")
+
+        # Ignore if we are not the coordinator.
+        if coordinator != self.name:
+            return
+
+        txn_id = data["txn_id"]
+        voter = data.get("from")
+        vote = bool(data.get("vote"))
+
+        txn = self.transactions.get(txn_id)
+        if txn is None:
+            return
+
+        txn.votes[voter] = vote
+
+        self.log_event(
+            f"TXN {txn_id}: received vote from {voter} → {vote} "
+            f"({len(txn.votes)}/{txn.expected_votes})"
+        )
+
+
+    def _handle_txn_commit(self, data: dict):
+        """
+        The coordinator decided to COMMIT the transaction.
+
+        Steps:
+        1. Apply the stored write_buffer changes to the real store.
+        2. Mark transaction as COMMITTED.
+        3. Release locks.
+        """
+
+        txn_id = data["txn_id"]
+        txn = self.transactions.get(txn_id)
+
+        # If we somehow missed the prepare stage, create a txn record
+        if txn is None:
+            txn = Transaction(txn_id, coordinator=data.get("coordinator", ""))
+            self.transactions[txn_id] = txn
+
+        # If already committed, nothing to do
+        if txn.state == "COMMITTED":
+            return
+
+        self._apply_write_buffer(txn)
+        txn.state = "COMMITTED"
+        self._release_locks(txn_id)
+
+        self.log_event(
+            f"TXN {txn_id}: COMMIT from coordinator={data.get('coordinator')}"
+        )
+
+
+    def _handle_txn_abort(self, data: dict):
+        """
+        The coordinator has ABORTED the transaction.
+
+        Steps:
+        1. Throw away any temporary changes.
+        2. Release locks.
+        3. Mark the transaction as ABORTED.
+        """
+
+        txn_id = data["txn_id"]
+        txn = self.transactions.get(txn_id)
+        if txn is None:
+            return
+
+        # If already aborted, no work to do.
+        if txn.state == "ABORTED":
+            return
+
+        # Delete uncommitted changes and unlock resources
+        txn.write_buffer.clear()
+        self._release_locks(txn_id)
+        txn.state = "ABORTED"
+
+        self.log_event(
+            f"TXN {txn_id}: ABORT from coordinator={data.get('coordinator')} "
+            f"(reason={data.get('reason')})"
+        )
 
     async def send_message(self, data: dict, ws=None):
 
@@ -283,21 +637,46 @@ class PeerNode:
 
     #period chat for demo
     async def periodic_chat(self, interval: float):
+        """
+        Every few seconds:
+        1. Ask for the distributed lock (Ricart–Agrawala).
+        2. Start a transaction that increments a shared counter.
+        3. Try to commit the transaction.
+        4. Broadcast a chat message showing the current store.
+        """
+
         while True:
             await asyncio.sleep(interval)
+
+            # 1. Get into critical section (distributed mutex)
             await self.request_cs()
 
-            text = f"hello from {self.name}"
+            # 2. Begin a transaction and add a write
+            txn_id = self.begin_transaction()
+            ok = self.txn_write(txn_id, "shared_counter", delta=1)
+
+            if ok:
+                # 3. Try to commit across all peers
+                await self.commit_transaction(txn_id)
+            else:
+                # If we could not get a lock, abort
+                await self.abort_transaction(txn_id, reason="lock conflict")
+
+            # 4. Send a chat message with the current shared data
+            text = f"hello from {self.name}, store={self.store}"
             print(f"[{self.name}] broadcasting: {text}")
             await self.send_chat(text)
 
             await asyncio.sleep(1.0)
 
+            # Leave critical section
             await self.release_cs()
+
 
     async def run(self, chat_interval: float):
         await self.start_server()
         await self.connect_to_peers()
+        await asyncio.sleep(5)
         asyncio.create_task(self.periodic_chat(chat_interval))
         await asyncio.Future()  # keep running forever
 
