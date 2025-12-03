@@ -42,6 +42,9 @@ class PeerNode:
     def __init__(self, name: str, port: int, peer_urls: list[str]):
         self.name = name
         self.port = port
+
+        self.peer_urls = peer_urls
+        
         self.known_peers: set[str] = set(peer_urls)  
         self.connections: set[websockets.WebSocketClientProtocol] = set()
         self.seen_messages: set[str] = set()
@@ -234,50 +237,137 @@ class PeerNode:
 
   # ---- server ----
     async def start_server(self):
+
         async def handler(ws):
-            self.connections.add(ws)
             print(f"[{self.name}] inbound connection")
+
             try:
+                # ------------------------------------------
+                # 1. First message MUST be hello
+                # ------------------------------------------
+                raw = await ws.recv()
+                data = json.loads(raw)
+                msg_type = data.get("type")
+                remote_name = data.get("from")
+
+                if msg_type != "hello":
+                    print(f"[{self.name}] inbound missing hello → closing")
+                    await ws.close()
+                    return
+
+                # ------------------------------------------
+                # 2. HARD inbound duplicate protection
+                # ------------------------------------------
+                for existing in list(self.connections):
+                    if getattr(existing, "peer_name", None) == remote_name:
+                        print(f"[{self.name}] closing duplicate inbound from {remote_name}")
+                        await ws.close()
+                        return
+
+                # ------------------------------------------
+                # 3. Register this inbound WS
+                # ------------------------------------------
+                ws.peer_name = remote_name
+                self.connections.add(ws)
+                self.log_event(f"inbound connection from {remote_name}")
+
+                # ------------------------------------------
+                # 4. Process hello immediately
+                # ------------------------------------------
+                await self.handle_message(raw, ws)
+
+                # ------------------------------------------
+                # 5. Main receive loop
+                # ------------------------------------------
                 async for raw in ws:
                     await self.handle_message(raw, ws)
+
             except websockets.exceptions.ConnectionClosed:
                 pass
+
             finally:
-                self.connections.discard(ws)
+                if ws in self.connections:
+                    self.connections.discard(ws)
                 print(f"[{self.name}] inbound connection closed")
 
+        # Start WS server
         server = await websockets.serve(handler, host="", port=self.port)
         print(f"[{self.name}] listening on ws://localhost:{self.port}")
         return server
 
+
     # client
-    async def connect_to_peer_loop(self, url: str):
-        """
-        Keep trying to connect to the given peer URL.
-        Demonstrates fault tolerance (retry on failure).
-        """
+    async def connect_to_peer_loop(self, url):
         while True:
             try:
                 print(f"[{self.name}] trying to connect to {url}")
                 ws = await websockets.connect(url)
-                self.connections.add(ws)
-                print(f"[{self.name}] connected to {url}")
 
+                # Send our hello
                 await self.send_hello(ws)
 
+                # Wait for hello from remote
+                raw = await ws.recv()
+                data = json.loads(raw)
+                remote_name = data.get("from")
+
+                if data.get("type") != "hello":
+                    print(f"[{self.name}] outbound connection missing hello → closing")
+                    await ws.close()
+                    await asyncio.sleep(3)
+                    continue
+
+                # ------------------------------------------
+                # Deduplicate outbound connections
+                # ------------------------------------------
+                duplicate = False
+                for existing in list(self.connections):
+                    if hasattr(existing, "peer_name") and existing.peer_name == remote_name:
+                        print(f"[{self.name}] closing duplicate outbound connection to {remote_name}")
+                        await ws.close()
+                        duplicate = True
+                        break
+
+                if duplicate:
+                    await asyncio.sleep(3)
+                    continue
+
+                # ------------------------------------------
+                # Register outbound connection
+                # ------------------------------------------
+                ws.peer_name = remote_name
+                self.connections.add(ws)
+                self.log_event(f"connected to {remote_name}")
+
+                # Process the remote hello
+                await self.handle_message(raw, ws)
+
+                # ------------------------------------------
+                # Process all other messages from this socket
+                # ------------------------------------------
                 async for raw in ws:
                     await self.handle_message(raw, ws)
 
             except Exception as e:
                 print(f"[{self.name}] connection to {url} failed: {e} (will retry)")
-                await asyncio.sleep(2)
-            finally:
-                if "ws" in locals():
-                    self.connections.discard(ws)
+                await asyncio.sleep(3)
 
     async def connect_to_peers(self):
-        for url in list(self.known_peers):
-            asyncio.create_task(self.connect_to_peer_loop(url))
+        def get_port(url):
+            return int(url.split(":")[-1])
+
+        my_port = self.port
+
+        for url in self.peer_urls:
+            peer_port = get_port(url)
+
+            # IMPORTANT: Only connect to peers with lower port number
+            if peer_port < my_port:
+                print(f"[{self.name}] outbound allowed → {url}")
+                asyncio.create_task(self.connect_to_peer_loop(url))
+            else:
+                print(f"[{self.name}] skipping outbound to {url} (higher port)")
+
 
     # message handling
     async def send_hello(self, ws=None):
@@ -699,7 +789,12 @@ async def main():
     )
     args = parser.parse_args()
 
-    node = PeerNode(name=args.name, port=args.port, peer_urls=args.peer)
+    node = PeerNode(
+        name=args.name, 
+        port=args.port, 
+        peer_urls=args.peer
+    )
+    
     await node.run(chat_interval=args.interval)
 
 
